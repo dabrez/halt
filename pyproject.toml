@@ -1,0 +1,12 @@
+[project]
+name = "halt"
+version = "0.1.0"
+description = "A runtime circuit breaker for agent sandboxes: allowlist fuses with pre-authorized kill authority outside the sandbox's own trust boundary."
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
