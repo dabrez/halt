@@ -34,9 +34,14 @@ no human has to be the one who pulls the trigger.
 - **Kill authority lives outside the fuses**, in `Supervisor` /
   `execute_kill`. Fuses only ever emit `TripEvent`s; they never act. One
   audit surface for the one thing that matters.
-- **Kill order is credentials → network → process**, not just "stop the
-  process" — a dead process with a still-valid credential is still a risk
-  from somewhere else.
+- **Kill order is credentials first, always** — a still-running process
+  with a live credential is a risk regardless of what happens next.
+  Network-vs-process ordering after that is **backend-dependent**, not
+  universal: `KillBackend.can_sever_network_before_terminate` tells
+  `execute_kill()` (kill.py) which order a given backend needs. This
+  isn't a hypothetical — it's a bug that was actually caught live: an
+  earlier version of this always did network-then-process, which is
+  provably wrong for Firecracker (see below).
 - **Every observation is logged, trip or not**, via `Sink`, before the kill
   decision is made — so the forensic record survives even if the kill
   itself fails partway.
@@ -50,10 +55,11 @@ no human has to be the one who pulls the trigger.
 `KillBackend` is the seam infra-specific kill logic plugs into
 (`revoke_credential` / `sever_network` / `terminate`). Two are provided:
 
-- **`FirecrackerBackend`** — kills a Firecracker microVM by tearing down
-  its host-side tap device and `SIGKILL`-ing the `firecracker` process
-  directly, rather than trusting a possibly-compromised guest to respond
-  to a graceful `SendCtrlAltDel` API call.
+- **`FirecrackerBackend`** — kills a Firecracker microVM by `SIGKILL`-ing
+  the `firecracker` process directly (rather than trusting a
+  possibly-compromised guest to respond to a graceful `SendCtrlAltDel` API
+  call), then tearing down its host-side tap device — that order is
+  required, not stylistic; see the verified finding below.
 - **`GvisorBackend`** — kills a `runsc` sandbox via `runsc kill` and drops
   its veth pair at the host, since gVisor (unlike Firecracker) has no
   device of its own to unplug — it rides on ordinary container networking.
@@ -76,7 +82,7 @@ solved this.
 
 ## What's real vs. stubbed
 
-**Real and tested** (34 tests, `pytest tests/ -v`): the policy matcher, all
+**Real and tested** (35 tests, `pytest tests/ -v`): the policy matcher, all
 three fuses, the supervisor's kill-triggering and first-kill-wins logic
 under concurrent trips, kill ordering, event serialization, the local
 JSONL sink, and the pure logic of both `FirecrackerBackend` and
@@ -113,16 +119,41 @@ recording because they'll bite the next person too:
    running its own sandboxes would set up proper cgroup delegation rather
    than routinely disable it.
 
-**Explicitly not verified against real infrastructure**: Firecracker.
-This environment has `/dev/kvm` present but the invoking user isn't in the
-`kvm` group and no `firecracker` binary is installed, so no real microVM
-has been booted or killed here — `FirecrackerBackend` is written against
-its documented API/CLI surface and remains reviewed-but-unexecuted.
-`GvisorBackend.sever_network()` (the veth-teardown path) is also untested
-live — the smoke test above only exercised `terminate()`, since the test
-container was run with `--network=none` and has no veth device to tear
-down; testing that path for real needs a sandbox actually wired to a veth
-pair. `ExternalBroadcastSink` and real cloud-IAM credential revocation are
+**`FirecrackerBackend` has been verified against a real, hardware-KVM-backed
+microVM** — the invoking user was added to the `kvm` group
+(`sudo usermod -aG kvm`), Firecracker v1.16.1 was downloaded directly from
+its GitHub release (checksum-verified), and a genuine Ubuntu 24.04 guest
+was booted using the official firecracker-ci kernel (`vmlinux-6.1.102`) and
+squashfs rootfs (converted to a writable ext4 image), with a real host-side
+tap device. The boot log shows a real KVM-detected kernel boot through to
+an actual login prompt inside the guest. Both `terminate()` and
+`sever_network()` were then called for real, not against fakes:
+
+- `terminate()` — confirmed the `firecracker` host process was actually
+  gone (`ps -p <pid>` before/after) after calling it.
+- `sever_network()` — first call, **while the VM was still alive, failed**:
+  `ip link set <tap> down` returned `Operation not permitted` when run
+  unprivileged, and even with root, `ip tuntap del` failed with
+  `ioctl(TUNSETIFF): Device or resource busy`, because the tap fd is held
+  open by the running firecracker process for the VM's entire life. Only
+  after `terminate()` killed the process did the same `ip` commands succeed
+  and the tap device actually disappear (`ip link show` → "does not
+  exist").
+
+That busy-tap finding was a real correctness bug, not a footnote: the
+original `execute_kill()` always ran network-severance before termination,
+which is provably wrong for any backend whose network teardown requires the
+process to already be dead. The fix — `can_sever_network_before_terminate`
+on `KillBackend`, `False` on `FirecrackerBackend`, and `execute_kill()`
+branching on it — is in `kill.py`, with a regression test
+(`test_execute_kill_terminates_before_severing_network_when_backend_requires_it`
+in `tests/test_kill.py`) that fails without the fix.
+
+**Still not verified live**: `GvisorBackend.sever_network()` (the
+veth-teardown path) — the runsc smoke test only exercised `terminate()`,
+since that test container ran with `--network=none` and had no veth device
+to tear down; testing that path for real needs a sandbox actually wired to
+one. `ExternalBroadcastSink` and real cloud-IAM credential revocation are
 also not implemented — both backends' `revoke_credential` deliberately
 delegates to an injected callback rather than assume any particular
 credential system.

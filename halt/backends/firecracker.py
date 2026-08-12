@@ -11,19 +11,28 @@ second isolation layer on top of KVM.
 Two independent things happen on kill, and both are real infra actions, not
 process bookkeeping:
 
-1. Network: Firecracker VMs reach the network through a host-side tap
-   device the host created. There is no "unplug the network" API call on
-   Firecracker's own control socket — the tap device is a host construct,
-   so severing it means removing it from the bridge / tearing it down at
-   the host network stack, same as unplugging a virtual cable. This runs
-   as `ip link set <tap> down` followed by `ip tuntap del`.
-2. Process: Firecracker exposes a Unix-socket HTTP API. The documented way
+1. Process: Firecracker exposes a Unix-socket HTTP API. The documented way
    to stop a running microVM is `PUT /actions` with
    `{"action_type": "SendCtrlAltDel"}` for a graceful guest shutdown, but a
    circuit breaker cannot wait on a possibly-compromised guest to shut
    itself down gracefully — so this backend goes straight to killing the
    firecracker host process (SIGKILL), which tears down the guest
    unconditionally regardless of what's running inside it.
+2. Network: Firecracker VMs reach the network through a host-side tap
+   device the host created. There is no "unplug the network" API call on
+   Firecracker's own control socket — the tap device is a host construct,
+   so severing it means removing it from the bridge / tearing it down at
+   the host network stack, same as unplugging a virtual cable. This runs
+   as `ip link set <tap> down` followed by `ip tuntap del`.
+
+**Process must be terminated before the tap device can be torn down, not
+after — this was wrong in an earlier version of this file and is now
+verified against a live VM.** The tap fd is held open by the running
+firecracker process for the VM's whole life; calling `ip tuntap del` while
+it's still alive fails with `ioctl(TUNSETIFF): Device or resource busy`. Only
+once the process is gone does deletion succeed. `can_sever_network_before_terminate
+= False` tells `execute_kill()` (kill.py) to order it this way — see that
+file's docstring for why this is backend-specific rather than a universal rule.
 
 Credential revocation is deliberately NOT infra-specific here — Firecracker
 has no concept of application-level credentials, so `revoke_credential`
@@ -31,12 +40,16 @@ delegates to an injected callback (e.g. a call to your cloud IAM API or an
 internal token service). This backend only owns what Firecracker/the host
 network stack actually control.
 
-UNVERIFIED IN THIS ENVIRONMENT: nothing in this file has been run against a
-live Firecracker VM. This machine has /dev/kvm but the invoking user is not
-in the `kvm` group, and no `firecracker` binary is installed, so there was
-no way to boot a real microVM here. The API socket protocol and `ip`
-commands below match Firecracker's documented API as of this writing; treat
-this as reviewed-but-unexecuted until it's run against a real instance.
+VERIFIED against a live instance: both `terminate()` and `sever_network()`
+have been run against a real, hardware-KVM-backed Firecracker v1.16.1
+microVM (Ubuntu 24.04 guest, booted from the official firecracker-ci
+kernel/rootfs images, real tap device on the host). `terminate()` was
+confirmed to kill the actual host process (checked via `ps` before/after).
+`sever_network()` was confirmed to fail while the VM was alive (the busy-tap
+finding above) and to succeed once `terminate()` ran first — which is what
+drove the ordering fix in kill.py. The `_call_api`/`SendCtrlAltDel` path
+below remains unexercised — it's kept only as the API-documented graceful
+alternative, not used by this backend's `terminate()`.
 """
 
 from __future__ import annotations
@@ -77,6 +90,8 @@ class FirecrackerVM:
 
 
 class FirecrackerBackend(KillBackend):
+    can_sever_network_before_terminate = False
+
     def __init__(
         self,
         revoke_credential_fn: Callable[[str], bool] | None = None,

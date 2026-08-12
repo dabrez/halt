@@ -32,6 +32,15 @@ class KillResult:
 
 
 class KillBackend(ABC):
+    #: True if sever_network() can succeed while the process is still
+    #: running. False if network teardown requires the process to be gone
+    #: first — e.g. Firecracker's tap device is held open by the VM
+    #: process for its whole life; deleting it while the VM is alive fails
+    #: with "Device or resource busy" (verified against a live microVM,
+    #: see FirecrackerBackend). execute_kill() uses this to pick the right
+    #: order instead of assuming one order works for every backend.
+    can_sever_network_before_terminate: bool = True
+
     @abstractmethod
     def revoke_credential(self, token_id: str) -> bool:
         raise NotImplementedError
@@ -85,15 +94,33 @@ class LocalProcessBackend(KillBackend):
 def execute_kill(
     backend: KillBackend, run_id: str, credential_ids: list[str]
 ) -> KillResult:
-    """Credentials first, then network, then process — a still-running
-    process with a live credential can act; a dead process with a live
-    credential cannot act itself but the credential remains a risk.
-    Revoking first minimizes the window either way.
+    """Credentials always go first — a still-running process with a live
+    credential can act, whether or not its network path is up (it may
+    already hold an established connection, or reach the network through
+    something this backend doesn't control), so revoking first minimizes
+    that window regardless of what follows.
+
+    Network vs. process ordering is backend-dependent, not universal:
+    when the backend can sever network reachability while the process
+    keeps running (e.g. a cloud security-group rule), do that first, so
+    a process that survives an initial failed terminate() is still cut
+    off. When it can't (Firecracker's tap device is held open by the VM
+    process itself — verified: attempting to delete it while the VM is
+    alive fails with "Device or resource busy"), terminate first, since
+    a network action that's guaranteed to fail is worse than skipping the
+    ordering theater and just killing the thing that's holding the
+    resource.
     """
     result = KillResult(run_id=run_id)
     for cred in credential_ids:
         if backend.revoke_credential(cred):
             result.credentials_revoked.append(cred)
-    result.network_severed = backend.sever_network(run_id)
-    result.process_terminated = backend.terminate(run_id)
+
+    if backend.can_sever_network_before_terminate:
+        result.network_severed = backend.sever_network(run_id)
+        result.process_terminated = backend.terminate(run_id)
+    else:
+        result.process_terminated = backend.terminate(run_id)
+        result.network_severed = backend.sever_network(run_id)
+
     return result
