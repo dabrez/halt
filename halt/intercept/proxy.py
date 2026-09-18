@@ -65,12 +65,15 @@ class InterceptedConnection:
     `host`/`port` are the agent's *intended* destination when `redirected`
     is True (recovered via SO_ORIGINAL_DST). When False they are the local
     socket address the agent happened to connect to, which is only a real
-    destination if the agent addressed the proxy directly.
+    destination if the agent addressed the proxy directly. Once TLS is
+    terminated (terminate.py) `host` is upgraded to the SNI / Host-header
+    name — the thing policy globs match on — and `ip` keeps the literal
+    address the agent connected to.
 
-    `path` is None at this layer and is not a placeholder for "/" — a TCP
-    connection has no path until something terminates TLS and reads a
-    request line. Callers must not invent one; a fuse that needs a path
-    should treat None as "unknown", never as "root".
+    `path` is None until something reads an HTTP request line, and None is
+    not a placeholder for "/" — a TCP connection has no path. Callers must
+    not invent one; a fuse that needs a path should treat None as
+    "unknown", never as "root".
     """
 
     host: str
@@ -81,6 +84,12 @@ class InterceptedConnection:
     peer: tuple[str, int] | None = None
     #: True if host/port came from SO_ORIGINAL_DST rather than getsockname.
     redirected: bool = False
+    #: The literal destination address (pre-NAT when redirected).
+    ip: str | None = None
+    #: Whether the agent spoke TLS to us.
+    tls: bool = False
+    #: HTTP method, when a request head was read.
+    method: str | None = None
 
 
 class DenyAllProxy:
@@ -95,8 +104,9 @@ class DenyAllProxy:
     deliberately not swallowed into silence — see _serve.
 
     Subclasses override `_handle_accepted()` to do something with the socket
-    (terminate TLS, consult policy, forward); the accept loop, observation
-    bookkeeping and error surfacing stay here.
+    (terminate TLS, consult policy, forward) and `_dispatch()` to change
+    the threading model; the accept loop, observation bookkeeping and error
+    surfacing stay here.
     """
 
     def __init__(
@@ -174,7 +184,8 @@ class DenyAllProxy:
 
     @property
     def callback_errors(self) -> list[BaseException]:
-        """Exceptions raised by on_connection, surfaced rather than hidden.
+        """Exceptions raised by on_connection or a handler, surfaced rather
+        than hidden.
 
         A fuse callback that throws would otherwise fail silently on a
         daemon thread — and a silently broken observation path is the exact
@@ -194,25 +205,39 @@ class DenyAllProxy:
             except OSError:
                 # Socket closed under us during stop(); normal shutdown.
                 break
+            self._dispatch(conn, peer)
 
+    def _dispatch(self, conn: socket.socket, peer: tuple[str, int]) -> None:
+        """Inline: handle, then close. Deny-all never blocks long enough to
+        need anything else. Whatever the handler did, the sandbox side of
+        the connection ends here.
+        """
+        try:
+            self._handle_accepted(conn, peer)
+        except Exception as exc:  # noqa: BLE001 - a handler bug must not kill the accept loop
+            with self._lock:
+                self._callback_errors.append(exc)
+        finally:
             try:
-                self._handle_accepted(conn, peer)
-            except Exception as exc:  # noqa: BLE001 - a handler bug must not kill the accept loop
-                with self._lock:
-                    self._callback_errors.append(exc)
-            finally:
-                # Whatever the handler did, the sandbox side ends here.
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+                conn.close()
+            except OSError:
+                pass
 
-    def _observe(
-        self, conn: socket.socket, peer: tuple[str, int]
-    ) -> InterceptedConnection:
-        """Record the attempt and notify the observer. Shared by every
+    def _notify(self, observed: InterceptedConnection) -> None:
+        """Record an observation and tell the observer. Shared by every
         posture so the bookkeeping is identical whether we deny or forward.
         """
+        with self._lock:
+            self._seen.append(observed)
+        if self._on_connection is not None:
+            try:
+                self._on_connection(observed)
+            except BaseException as exc:  # noqa: BLE001 - recorded, not swallowed
+                with self._lock:
+                    self._callback_errors.append(exc)
+
+    def _handle_accepted(self, conn: socket.socket, peer: tuple[str, int]) -> None:
+        """Deny-all: observe at the TCP layer, then let _dispatch close it."""
         dst = original_destination(conn)
         if dst is not None:
             host, port, redirected = dst[0], dst[1], True
@@ -223,25 +248,8 @@ class DenyAllProxy:
                 host, port = ("unknown", -1)
             redirected = False
 
-        observed = InterceptedConnection(
-            host=host,
-            port=port,
-            path=None,
+        self._notify(InterceptedConnection(
+            host=host, port=port, path=None,
             peer=peer[:2] if peer else None,
-            redirected=redirected,
-        )
-
-        with self._lock:
-            self._seen.append(observed)
-
-        if self._on_connection is not None:
-            try:
-                self._on_connection(observed)
-            except BaseException as exc:  # noqa: BLE001 - recorded, not swallowed
-                with self._lock:
-                    self._callback_errors.append(exc)
-        return observed
-
-    def _handle_accepted(self, conn: socket.socket, peer: tuple[str, int]) -> None:
-        """Deny-all: observe, then let _serve close it. Nothing forwarded."""
-        self._observe(conn, peer)
+            redirected=redirected, ip=host,
+        ))

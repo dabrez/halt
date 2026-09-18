@@ -35,3 +35,8 @@ def run_live(script: str, timeout: float = 60) -> subprocess.CompletedProcess:
 def test_live_redirect_makes_contained_traffic_visible():
     r = run_live("redirect_scenario.py")
     assert r.returncode == 0, f"\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+
+
+def test_live_tls_termination_through_redirect():
+    r = run_live("terminate_scenario.py")
+    assert r.returncode == 0, f"\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
