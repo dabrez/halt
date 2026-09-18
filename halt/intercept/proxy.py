@@ -6,45 +6,71 @@ only ever sees a connection because the calling code volunteered it, which
 means an agent that just opens a socket is never observed at all.
 
 The proxy closes that gap by construction rather than by cooperation. The
-sandbox is placed in a network namespace whose only route out is this
-listener (see netns.py), so a connection attempt is observed because it had
-nowhere else to go — not because anything inside the sandbox chose to report
-it.
+sandbox is placed in a network namespace whose only route out is the host
+side of a veth pair, and a nat REDIRECT rule there pulls every TCP
+connection into this listener (see netns.py). A connection attempt is
+observed because it had nowhere else to go — not because anything inside
+the sandbox chose to report it.
 
-MILESTONE 1 SCOPE — deliberately tiny:
+Where the destination comes from: after REDIRECT the accepted socket's own
+address is the proxy's, not where the agent was going. The kernel keeps the
+pre-NAT destination in conntrack and hands it back through the
+SO_ORIGINAL_DST socket option; `original_destination()` reads it. Verified
+live (2026-09-17): connections aimed at 1.1.1.1:443, 93.184.216.34:80 and
+8.8.8.8:53 arrived here with all three recovered exactly. Without REDIRECT
+(milestone 1's posture) the option is absent and we fall back to the local
+socket address, flagged with `redirected=False` so nothing downstream
+mistakes the proxy's own address for the agent's target.
 
-    Deny everything. Parse nothing. Allow no traffic through.
-
-No TLS termination, no path extraction, no policy consultation. The risky
-assumption being tested here is *not* "can we parse HTTP" — it is "can we
-actually force all egress through this thing." That claim either holds or it
-doesn't, and it is worth isolating from every other source of failure. A
-plaintext-only-but-forwarding proxy would have taught us the easy half and
-postponed the hard one.
-
-Consequently `observe_connection()` below reports host and port and a path of
-None. That is honest rather than lazy: at this layer, before any TLS
-termination, the path genuinely is not knowable. Milestone 2 (see ROADMAP.md)
-adds termination and with it the path, which is what NetworkRule actually
-wants to match on.
+`DenyAllProxy` is milestone 1's posture, kept as the base: accept, record,
+close. It still parses nothing and forwards nothing. Path is None here
+because before TLS termination it genuinely is not knowable — see
+terminate.py for the layer that adds it.
 """
 
 from __future__ import annotations
 
 import socket
+import struct
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
+
+#: Linux-specific getsockopt level/option for the pre-NAT destination. Not
+#: exposed as a constant by the socket module.
+_SOL_IP = 0
+_SO_ORIGINAL_DST = 80
+
+
+def original_destination(sock: socket.socket) -> tuple[str, int] | None:
+    """The address the peer was connecting to before REDIRECT rewrote it.
+
+    Returns None when the option is unavailable (no NAT applied to this
+    connection, non-Linux, or non-IPv4). Callers must treat None as
+    "unknown" — it never means "the local address".
+    """
+    try:
+        raw = sock.getsockopt(_SOL_IP, _SO_ORIGINAL_DST, 16)
+    except OSError:
+        return None
+    # struct sockaddr_in: family(2) port(2, network order) addr(4) zero(8)
+    port, addr = struct.unpack("!2xH4s8x", raw)
+    return socket.inet_ntoa(addr), port
 
 
 @dataclass(frozen=True)
 class InterceptedConnection:
     """One egress attempt seen by the proxy.
 
-    `path` is None at this milestone and is not a placeholder for "/" — a
-    CONNECT-less TCP connection has no path until something terminates TLS
-    and reads a request line. Callers must not invent one; a fuse that needs
-    a path should treat None as "unknown", never as "root".
+    `host`/`port` are the agent's *intended* destination when `redirected`
+    is True (recovered via SO_ORIGINAL_DST). When False they are the local
+    socket address the agent happened to connect to, which is only a real
+    destination if the agent addressed the proxy directly.
+
+    `path` is None at this layer and is not a placeholder for "/" — a TCP
+    connection has no path until something terminates TLS and reads a
+    request line. Callers must not invent one; a fuse that needs a path
+    should treat None as "unknown", never as "root".
     """
 
     host: str
@@ -53,20 +79,24 @@ class InterceptedConnection:
     #: Address the sandbox-side socket connected from, useful for
     #: correlating an attempt back to a process during verification.
     peer: tuple[str, int] | None = None
+    #: True if host/port came from SO_ORIGINAL_DST rather than getsockname.
+    redirected: bool = False
 
 
 class DenyAllProxy:
     """A TCP listener that accepts, records, and immediately closes.
 
-    Nothing is forwarded upstream. This is the milestone-1 enforcement
+    Nothing is forwarded upstream. This is the deny-everything enforcement
     posture: the sandbox's only route out terminates here, and here refuses.
-    A connection reaching this listener is proof the routing worked; a
-    connection *not* reaching it while the sandbox still gets out is the
-    finding we care about most (see ROADMAP.md).
+    A connection reaching this listener is proof the routing worked.
 
     `on_connection` is called for every accepted attempt, on the accepting
     thread, before the socket is closed. Exceptions from the callback are
     deliberately not swallowed into silence — see _serve.
+
+    Subclasses override `_handle_accepted()` to do something with the socket
+    (terminate TLS, consult policy, forward); the accept loop, observation
+    bookkeeping and error surfacing stay here.
     """
 
     def __init__(
@@ -102,7 +132,7 @@ class DenyAllProxy:
         self._sock = sock
 
         self._thread = threading.Thread(
-            target=self._serve, name="halt-deny-all-proxy", daemon=True
+            target=self._serve, name=f"halt-{type(self).__name__}", daemon=True
         )
         self._thread.start()
 
@@ -166,38 +196,52 @@ class DenyAllProxy:
                 break
 
             try:
-                self._handle(conn, peer)
+                self._handle_accepted(conn, peer)
+            except Exception as exc:  # noqa: BLE001 - a handler bug must not kill the accept loop
+                with self._lock:
+                    self._callback_errors.append(exc)
             finally:
-                # Deny-all: nothing is forwarded, the connection dies here.
+                # Whatever the handler did, the sandbox side ends here.
                 try:
                     conn.close()
                 except OSError:
                     pass
 
-    def _handle(self, conn: socket.socket, peer: tuple[str, int]) -> None:
-        # SO_ORIGINAL_DST would give the pre-DNAT destination under a
-        # REDIRECT rule. Milestone 1 routes rather than redirects, so the
-        # original destination is not recoverable here yet; record what is
-        # actually known instead of fabricating it.
-        try:
-            local_host, local_port = conn.getsockname()[:2]
-        except OSError:
-            local_host, local_port = ("unknown", -1)
+    def _observe(
+        self, conn: socket.socket, peer: tuple[str, int]
+    ) -> InterceptedConnection:
+        """Record the attempt and notify the observer. Shared by every
+        posture so the bookkeeping is identical whether we deny or forward.
+        """
+        dst = original_destination(conn)
+        if dst is not None:
+            host, port, redirected = dst[0], dst[1], True
+        else:
+            try:
+                host, port = conn.getsockname()[:2]
+            except OSError:
+                host, port = ("unknown", -1)
+            redirected = False
 
         observed = InterceptedConnection(
-            host=local_host,
-            port=local_port,
+            host=host,
+            port=port,
             path=None,
             peer=peer[:2] if peer else None,
+            redirected=redirected,
         )
 
         with self._lock:
             self._seen.append(observed)
 
-        if self._on_connection is None:
-            return
-        try:
-            self._on_connection(observed)
-        except BaseException as exc:  # noqa: BLE001 - recorded, not swallowed
-            with self._lock:
-                self._callback_errors.append(exc)
+        if self._on_connection is not None:
+            try:
+                self._on_connection(observed)
+            except BaseException as exc:  # noqa: BLE001 - recorded, not swallowed
+                with self._lock:
+                    self._callback_errors.append(exc)
+        return observed
+
+    def _handle_accepted(self, conn: socket.socket, peer: tuple[str, int]) -> None:
+        """Deny-all: observe, then let _serve close it. Nothing forwarded."""
+        self._observe(conn, peer)

@@ -7,34 +7,43 @@ no other way out; that property comes from here, not from the proxy.
 Shape:
 
     sandbox netns                host netns
-    +-------------+              +-------------------+
-    |  agent      |   veth pair  |                   |
-    |  default ---+--------------+--> HALT proxy     |
-    |  route      |              |    (deny-all)     |
-    +-------------+              +-------------------+
+    +-------------+              +----------------------------------+
+    |  agent      |   veth pair  |  PREROUTING -i halt0 -p tcp      |
+    |  default ---+--------------+--> REDIRECT --to-ports <proxy>   |
+    |  route      |              |  INPUT/FORWARD -i halt0 !tcp DROP|
+    +-------------+              +----------------------------------+
 
 The sandbox side gets an address, a default route pointing at the host side,
 and nothing else — no other interface, no second route. An agent opening a
 raw socket to an arbitrary address still has exactly one path out of the
 namespace, and it terminates at HALT.
 
-WHAT THIS MODULE DOES NOT DO (milestone 1, see ROADMAP.md):
+Two layers, and it matters which does what (verified live, 2026-09-17):
 
-It does not DNAT/REDIRECT arbitrary destination addresses onto the proxy's
-port. That means a connection to 10.0.0.2:PROXY_PORT is intercepted, but a
-connection to example.com:443 is routed at the host side and dropped rather
-than landing in the proxy's accept loop. Recovering the *original*
-destination needs an iptables REDIRECT plus SO_ORIGINAL_DST, which is
-milestone 2 work — it is also precisely what makes host/port recoverable,
-and why proxy.py currently reports the local socket address instead of
-pretending to know the intended destination.
+* **Containment** comes from routing alone. With no route past the host
+  side and ip_forward off, arbitrary destinations die at the veth. Milestone
+  1 proved this — and also proved that containment by itself gives HALT no
+  *visibility*: a connection to 1.1.1.1:443 was dropped without ever
+  reaching the proxy's accept loop.
+* **Visibility** comes from `redirect_tcp_to()`: a nat PREROUTING REDIRECT
+  pulls every TCP connection arriving from the sandbox into the proxy, which
+  recovers the intended destination via SO_ORIGINAL_DST (see proxy.py).
+  Verified live: an agent aiming at 1.1.1.1:443, 93.184.216.34:80 and
+  8.8.8.8:53 landed in the proxy with all three original destinations
+  recovered exactly.
 
-The claim being tested at this milestone is narrower and prior to that:
-**that a process in the namespace has no route out except through HALT.**
+`drop_non_tcp()` is the explicit backstop for everything REDIRECT does not
+cover (UDP, ICMP, raw). Live, those packets were already discarded by the
+router before reaching the filter chains — the DROP counters read 0 — so
+these rules are belt to routing's braces: they turn "contained by accident of
+ip_forward=0" into "contained by policy". Non-TCP is contained but NOT
+observed; making it visible needs NFLOG and is recorded in ROADMAP.md.
 
-Everything here shells out to `ip`. Commands are executed through an
+Everything here shells out to `ip` / `iptables`. Commands run through an
 injectable `run_command` so the command *sequence* is testable without root,
-in the same style as FirecrackerBackend/GvisorBackend.
+in the same style as FirecrackerBackend/GvisorBackend. The live path needs
+CAP_NET_ADMIN in the host namespace — root, or root-in-userns via
+`unshare -rnm` (which is how the live tests in tests/live/ run).
 """
 
 from __future__ import annotations
@@ -84,6 +93,10 @@ class NetnsEgress:
         self.config = config
         self._run = run_command
         self._created = False
+        # Every iptables rule added, as its `-A` argument list, so destroy()
+        # can `-D` each one. Rules live in the host namespace and would
+        # otherwise outlive the sandbox they were written for.
+        self._rules: list[list[str]] = []
 
     # -- command helpers ----------------------------------------------
 
@@ -92,6 +105,10 @@ class NetnsEgress:
 
     def _in_ns(self, *args: str) -> subprocess.CompletedProcess:
         return self._run(["ip", "netns", "exec", self.config.name, *args])
+
+    def _iptables_add(self, *rule: str) -> subprocess.CompletedProcess:
+        self._rules.append(list(rule))
+        return self._run(["iptables", *rule])
 
     # -- lifecycle ----------------------------------------------------
 
@@ -122,12 +139,50 @@ class NetnsEgress:
 
         self._created = True
 
+    def redirect_tcp_to(self, proxy_port: int) -> bool:
+        """Pull every TCP connection from the sandbox into the proxy.
+
+        This is what turns containment into visibility. Without it the
+        proxy only ever sees traffic already addressed to it (the milestone
+        1 finding); with it, the agent's *intended* destination is preserved
+        in conntrack and readable via SO_ORIGINAL_DST on the accepted socket.
+        """
+        r = self._iptables_add(
+            "-t", "nat", "-A", "PREROUTING",
+            "-i", self.config.host_if, "-p", "tcp",
+            "-j", "REDIRECT", "--to-ports", str(proxy_port),
+        )
+        return r.returncode == 0
+
+    def drop_non_tcp(self) -> bool:
+        """Explicitly discard what REDIRECT can't capture.
+
+        Routing already contains non-TCP (no forward path), but a rule says
+        so on purpose rather than relying on ip_forward staying off. Both
+        chains: INPUT for packets aimed at the host side itself, FORWARD for
+        anything that would otherwise be routed onward.
+        """
+        a = self._iptables_add(
+            "-A", "INPUT", "-i", self.config.host_if, "!", "-p", "tcp", "-j", "DROP"
+        )
+        b = self._iptables_add(
+            "-A", "FORWARD", "-i", self.config.host_if, "-j", "DROP"
+        )
+        return a.returncode == 0 and b.returncode == 0
+
     def destroy(self) -> None:
-        """Tear down. Deleting the namespace takes the veth peer with it;
-        the explicit host-side link delete is belt-and-braces for the case
-        where the pair was created but the move into the namespace failed.
+        """Tear down, rules first (they reference the interface by name and
+        would silently keep matching a future interface with the same name),
+        then the namespace, which takes the veth peer with it. The explicit
+        host-side link delete is belt-and-braces for the case where the pair
+        was created but the move into the namespace failed.
         """
         c = self.config
+        for rule in reversed(self._rules):
+            delete = ["-D" if tok == "-A" else tok for tok in rule]
+            self._run(["iptables", *delete])
+        self._rules.clear()
+
         self._ip("netns", "del", c.name)
         self._ip("link", "del", c.host_if)
         self._created = False
