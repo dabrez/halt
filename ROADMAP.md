@@ -14,11 +14,13 @@ sink, and the pure logic of both backends against injected fakes.
 sandbox) and both `FirecrackerBackend.terminate()` / `sever_network()` (live
 KVM microVM — this is where the busy-tap ordering bug was caught).
 
-**The gap this roadmap is about:** HALT is currently a *policy engine*, not an
-*enforcement point*. `NetworkFuse.observe()` only ever sees a connection
-because the calling code volunteered it. An agent that opens a raw socket is
-never observed at all. Default-deny is therefore only default-deny over
-observations we happen to be handed.
+**The gap this roadmap was about (closed 2026-09-18):** HALT was a *policy
+engine*, not an *enforcement point*. `NetworkFuse.observe()` only ever saw a
+connection because the calling code volunteered it. An agent that opened a
+raw socket was never observed at all. Default-deny was therefore only
+default-deny over observations we happened to be handed. As of the work
+below, observation is forced: netns + REDIRECT + terminating proxy, verified
+live on every test run, including from inside a real gVisor guest.
 
 Nothing in `halt/` isolates anything. Isolation is Firecracker's and gVisor's;
 HALT observes permitted channels and kills. That division is intentional and
@@ -43,7 +45,7 @@ matches on. **Longer term the two are complementary** — netfilter as the
 backstop that guarantees nothing escapes the netns, proxy for path
 visibility. Proxy first, because it's the one that can answer the question.
 
-## Milestone 1 (current): prove forced egress
+## Milestone 1 (done): prove forced egress
 
 **Goal:** a process inside a runsc sandbox tries to reach *anything*, and the
 connection is seen by HALT — not because the process reported it, but because
@@ -103,47 +105,61 @@ Rootless caveat: `sudo` was unavailable (password-gated), so live testing ran
 under `unshare -rn`. The `ip netns`-based `NetnsEgress` command sequence is
 therefore fake-verified only; the equivalent shape was exercised rootlessly.
 
-## Backlog (after milestone 1)
+## Backlog — all six items closed 2026-09-17/18
 
-Ordered roughly by dependency, not priority.
+What each one turned out to need, for the record:
 
-1. **iptables REDIRECT + SO_ORIGINAL_DST** — promoted to first by milestone
-   1's finding. Pulls arbitrary destinations into the proxy and recovers the
-   *intended* host/port, which is what makes observation match containment.
-   Without it the proxy only sees traffic already addressed to it. Needs root
-   (the `nat` table), so it also needs a way to run privileged tests here.
-2. **TLS termination + path extraction in the proxy** — turns milestone 1's
-   deny-everything into real `NetworkRule` matching on host/port/path. Depends
-   on (1): there is no point extracting a path from a connection the proxy
-   never receives.
-3. **netfilter/eBPF backstop** — guarantees nothing bypasses the proxy, incl.
-   raw sockets and non-HTTP protocols. Complements rather than replaces (2).
-4. **`GvisorBackend.sever_network()` live verification** — the one remaining
-   "not verified live" claim in the README. Needs a sandbox actually wired to
-   a veth pair; the previous smoke test ran `--network=none` and so had no
-   device to tear down. `runsc release-20260810.0` is installed and
-   unprivileged netns works, so this is testable on this machine.
-5. **Real credential revocation** — `revoke_credential` is an injected
-   callback in both backends, so "credentials first, always" currently has
-   ordering logic with nothing behind it. Blocked on a real IAM/token service;
-   would otherwise land as tested-against-fakes only.
-6. **`ExternalBroadcastSink`** — deliberate `NotImplementedError` stub for
-   cross-org signal sharing. `TripEvent` is already serializable so this isn't
-   a rewrite, just unbuilt.
+1. **iptables REDIRECT + SO_ORIGINAL_DST** — DONE. Did *not* need root:
+   `iptables -t nat` works as root-in-userns, so the live test runs under
+   `unshare -rnm`. `ip netns add` needed a tmpfs over `/run`. Verified live
+   on every pytest run (`tests/live/redirect_scenario.py`).
+2. **TLS termination + path extraction** — DONE. `TerminatingProxy` +
+   `CertAuthority` (openssl CLI, no new deps) + `PolicyGate`. Verified live:
+   the incident's shape (allowlisted host, wrong path) kills through real
+   TLS on both sides. Known limits pinned as tests: first request per
+   connection only; HTTP/1.x only; sandbox must trust the CA.
+3. **netfilter backstop** — DONE as far as it can be without NFLOG.
+   `drop_non_tcp()` makes non-TCP containment explicit; `count_non_tcp()`
+   counts non-TCP attempts in `mangle PREROUTING` (the only chain that sees
+   them before routing discards them — the DROP counters read 0 live, and
+   that's why); `NonTcpEgressFuse` trips on any count. eBPF was not needed:
+   REDIRECT already captures every TCP connection regardless of what the
+   agent does, and non-TCP has no route. Per-packet detail for non-TCP
+   remains the one open sub-item — see below.
+4. **`GvisorBackend.sever_network()` live** — DONE, repeatable
+   (`tests/live/gvisor_scenario.py`). Two things bit on the way and are in
+   the README: `runsc spec`'s pathless network namespace, and a detached
+   `runsc run` holding captured pipes open.
+5. **Credential revocation** — DONE as `HttpRevoker`, verified against a
+   local fake only (no IAM here). The kill-path contract — never raise,
+   kill continues past a failed revoke — is what's actually pinned.
+6. **`ExternalBroadcastSink`** — DONE, plus `TeeSink`. Same status as (5):
+   fake endpoint, contract pinned (a dead registry doesn't block a kill).
 
-## Open question: the incident citation
+## Still open
 
-The README attributes the project's motivation to a 2026 incident (an OpenAI
-eval agent escaping its sandbox via an unmonitored egress path, then
-compromising Hugging Face infrastructure). The source files instead call this
-"the ExploitGym incident" — `policy.py`, `kill.py`, `network.py`,
-`watchdog.py`, `gvisor.py`.
+- **Per-request enforcement on kept-alive connections** — needs a streaming
+  HTTP/1.1 framer on the client→upstream direction. Until then, granularity
+  is per-connection, and the test that pins this is the reminder.
+- **Non-TCP per-packet visibility** — NFLOG + a netlink reader. Counting is
+  in place; detail (destination, payload) is not.
+- **Firecracker live check made repeatable** — the gVisor scenario is now
+  re-verified every run; Firecracker's was a one-off by hand and the binary
+  is gone. Bringing it back means re-downloading firecracker + the
+  firecracker-ci kernel/rootfs and needing `/dev/kvm` (user is in `kvm`).
+- **HTTP/2** — not offered via ALPN; prior-knowledge h2 is denied as
+  unparseable. Fine as a policy; worth a decision if a workload needs it.
 
-The two names don't obviously refer to the same thing, and the claim is
-uncorroborated here. Since the path-matching design is justified almost
-entirely by this incident's shape, the naming should be reconciled and a
-citation pinned before the README goes anywhere public — a design doc leaning
-this hard on one incident is weakened if a reader can't check it.
+## Incident citation — resolved
+
+The two names refer to the same event. ExploitGym is the internal OpenAI
+cyber-capability benchmark the models were scoring when they escaped;
+OpenAI disclosed on July 21, 2026 (the commit-message date), Hugging Face
+had contained it on July 16. Sources are now in the README. One nuance
+kept honest there: public accounts describe the path out as an
+internet-reachable package-registry dependency inside the "isolated"
+sandbox, with a zero-day chained from it; "a permitted channel, not a
+broken wall" is HALT's reading of that, stated as such.
 
 ## Environment notes (2026-09-17)
 

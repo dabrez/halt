@@ -77,6 +77,18 @@ class NetnsConfig:
         return f"{self.sandbox_addr}/{self.prefix_len}"
 
 
+def _run_captured(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    """Default runner. Output *must* be captured: non_tcp_packets() reads
+    the iptables listing from stdout, and a plain subprocess.run would hand
+    it None — a counter that silently reads 0 forever is exactly the kind
+    of quiet failure a fuse must not have. (Found by running the README
+    example for real.)
+    """
+    kw.setdefault("capture_output", True)
+    kw.setdefault("text", True)
+    return subprocess.run(cmd, **kw)
+
+
 class NetnsEgress:
     """Creates and tears down the forced-egress namespace.
 
@@ -88,7 +100,7 @@ class NetnsEgress:
     def __init__(
         self,
         config: NetnsConfig,
-        run_command: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        run_command: Callable[..., subprocess.CompletedProcess] = _run_captured,
     ):
         self.config = config
         self._run = run_command
@@ -170,6 +182,29 @@ class NetnsEgress:
         )
         return a.returncode == 0 and b.returncode == 0
 
+    def count_non_tcp(self) -> bool:
+        """Make non-TCP attempts *countable*, since they can't be captured.
+
+        The DROP rules never see them: with no forward path the router
+        discards a UDP or ICMP packet before any filter chain runs, which
+        is why those counters read 0 live. `mangle PREROUTING` runs before
+        routing and sees every packet that arrives on the interface — so a
+        target-less rule there is a counter of non-TCP egress attempts.
+        Verified live: two pings from the sandbox → 2 packets counted.
+
+        This is visibility of *that something happened*, not of what. Per-
+        packet detail (destination, payload) needs NFLOG; see ROADMAP.md.
+        """
+        r = self._iptables_add(
+            "-t", "mangle", "-A", "PREROUTING", "-i", self.config.host_if, "!", "-p", "tcp"
+        )
+        return r.returncode == 0
+
+    def non_tcp_packets(self) -> int:
+        """Packets matched by the count_non_tcp() rule so far."""
+        r = self._run(["iptables", "-t", "mangle", "-L", "PREROUTING", "-v", "-n", "-x"])
+        return _parse_non_tcp_counter(r.stdout or "", self.config.host_if)
+
     def destroy(self) -> None:
         """Tear down, rules first (they reference the interface by name and
         would silently keep matching a future interface with the same name),
@@ -207,3 +242,19 @@ class NetnsEgress:
         test to make an egress attempt from a real process.
         """
         return self._in_ns(*args)
+
+
+def _parse_non_tcp_counter(listing: str, host_if: str) -> int:
+    """Sum the pkts column of `iptables -L -v -n -x` rows that are our
+    interface's `! -p tcp` rule. With -n the protocol column reads `!6`.
+    A target-less rule has no target column, so match by content rather
+    than position.
+    """
+    total = 0
+    for line in listing.splitlines():
+        tok = line.split()
+        if len(tok) < 6 or not tok[0].isdigit():
+            continue
+        if host_if in tok and ("!6" in tok or "!tcp" in tok):
+            total += int(tok[0])
+    return total

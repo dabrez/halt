@@ -4,6 +4,7 @@ forbids that, so a clean run elsewhere is not mistaken for verification.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 
@@ -39,4 +40,11 @@ def test_live_redirect_makes_contained_traffic_visible():
 
 def test_live_tls_termination_through_redirect():
     r = run_live("terminate_scenario.py")
+    assert r.returncode == 0, f"\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+
+
+def test_live_gvisor_guest_forced_egress_then_severed():
+    if shutil.which("runsc") is None:
+        pytest.skip("runsc not installed")
+    r = run_live("gvisor_scenario.py", timeout=120)
     assert r.returncode == 0, f"\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"

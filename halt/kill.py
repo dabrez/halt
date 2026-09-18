@@ -8,13 +8,13 @@ the run, sever its network path, then terminate it — in that order, since
 killing the process first gives a still-valid credential a window to be
 used from somewhere else.
 
-`KillBackend` is the seam. `LocalProcessBackend` is real and tested here —
-it can revoke tokens from an in-memory registry and terminate a local
-subprocess. Backends for real infra (cloud IAM token revocation, a
-Firecracker host-side supervisor severing a VM's tap interface) are NOT
-implemented here — this environment has no cloud credentials and no
-/dev/kvm to test them against. Wiring one up is real, hardware/infra-backed
-work, not a stub to paper over.
+`KillBackend` is the seam. `LocalProcessBackend` is the dev/test backend —
+an in-memory credential registry and a local subprocess. The real ones live
+in halt/backends/ (Firecracker, gVisor; both verified against live
+instances) and delegate credential revocation to an injected callback such
+as halt.credentials.HttpRevoker, because neither VM nor container runtime
+has any notion of an application token — revocation happens wherever the
+token was issued.
 """
 
 from __future__ import annotations
